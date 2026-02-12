@@ -6,6 +6,8 @@ An interactive 3D viewer for denoised cryo-EM micrographs, enabling intuitive ex
 
 https://youtu.be/tGr9yvtkZG8
 
+https://youtu.be/xmCIDMZkR8M?si=7Eap-uLpPxFMNfyK
+
 ## Key Achievement
 
 This project demonstrates that **viewing cryo-EM data in 3D space significantly enhances structure visibility** - even for inherently 2D projection images. By moving the image through 3D space, the visual cortex engages differently than with static 2D viewing, making it easier to distinguish signal from noise and identify protein structures.
