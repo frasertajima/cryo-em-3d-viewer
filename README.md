@@ -2,8 +2,6 @@
 
 An interactive 3D viewer for denoised cryo-EM micrographs, enabling intuitive exploration of protein structures through depth perception and motion parallax.
 
-![Cryo-EM Viewer](docs/viewer_screenshot.png)
-
 https://youtu.be/tGr9yvtkZG8
 
 https://youtu.be/xmCIDMZkR8M?si=7Eap-uLpPxFMNfyK
