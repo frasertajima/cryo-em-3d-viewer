@@ -1,0 +1,516 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Cryo-EM Image Viewer</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: #0a0a0a;
+            color: #e0e0e0;
+            overflow: hidden;
+        }
+
+        #container { display: flex; height: 100vh; }
+
+        #canvas-container {
+            flex: 1;
+            position: relative;
+            background: #000;
+        }
+
+        #viewer { width: 100%; height: 100%; display: block; }
+
+        /* Smaller label, positioned left */
+        #frame-indicator {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            background: rgba(0, 0, 0, 0.7);
+            padding: 8px 15px;
+            border-radius: 6px;
+            z-index: 100;
+            border: 1px solid #00bcd4;
+            text-align: left;
+            font-size: 0.7em;
+        }
+
+        #frame-indicator h1 { color: #00bcd4; font-size: 1em; margin-bottom: 4px; }
+        #frame-counter { font-size: 1.4em; font-weight: bold; color: #fff; }
+        #frame-name { color: #888; font-size: 0.75em; margin-top: 3px; word-break: break-all; max-width: 200px; }
+
+        #nav-hints {
+            position: absolute;
+            bottom: 10px;
+            left: 10px;
+            background: rgba(0, 0, 0, 0.6);
+            padding: 8px 15px;
+            border-radius: 6px;
+            z-index: 100;
+            display: flex;
+            gap: 15px;
+            font-size: 0.65em;
+        }
+
+        .hint { display: flex; align-items: center; gap: 5px; }
+        .key {
+            background: #333;
+            border: 1px solid #555;
+            border-radius: 3px;
+            padding: 2px 6px;
+            font-family: monospace;
+            color: #00bcd4;
+            font-size: 0.9em;
+        }
+
+        #control-panel {
+            width: 250px;
+            background: rgba(20, 20, 30, 0.95);
+            padding: 15px;
+            overflow-y: auto;
+            border-left: 2px solid #00bcd4;
+        }
+
+        #control-panel h2 {
+            color: #00bcd4;
+            font-size: 1em;
+            margin-bottom: 12px;
+            padding-bottom: 8px;
+            border-bottom: 1px solid #333;
+        }
+
+        .section {
+            margin-bottom: 15px;
+            background: rgba(30, 30, 40, 0.8);
+            padding: 12px;
+            border-radius: 6px;
+            border: 1px solid #333;
+        }
+
+        .section h3 {
+            color: #ff9800;
+            font-size: 0.8em;
+            margin-bottom: 10px;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+        }
+
+        .control-group { margin-bottom: 10px; }
+        label { display: block; margin-bottom: 4px; font-size: 0.75em; color: #bbb; }
+        .value-display { float: right; color: #00bcd4; font-weight: bold; }
+
+        input[type="range"] {
+            width: 100%;
+            height: 5px;
+            background: #333;
+            border-radius: 3px;
+            outline: none;
+            -webkit-appearance: none;
+        }
+
+        input[type="range"]::-webkit-slider-thumb {
+            -webkit-appearance: none;
+            width: 14px;
+            height: 14px;
+            background: #00bcd4;
+            border-radius: 50%;
+            cursor: pointer;
+        }
+
+        button {
+            width: 100%;
+            padding: 8px;
+            margin: 3px 0;
+            background: linear-gradient(135deg, #00bcd4 0%, #0097a7 100%);
+            border: none;
+            border-radius: 4px;
+            color: white;
+            font-size: 0.75em;
+            font-weight: bold;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+
+        button:hover {
+            transform: translateY(-1px);
+            box-shadow: 0 3px 10px rgba(0, 188, 212, 0.4);
+        }
+
+        .nav-buttons { display: flex; gap: 8px; }
+        .nav-buttons button { flex: 1; font-size: 1em; padding: 12px; }
+
+        #status {
+            padding: 8px;
+            background: rgba(0, 188, 212, 0.15);
+            border-radius: 4px;
+            font-size: 0.7em;
+            margin-bottom: 12px;
+            border-left: 3px solid #00bcd4;
+        }
+
+        .help-text {
+            font-size: 0.65em;
+            color: #888;
+            line-height: 1.5;
+            background: rgba(0, 0, 0, 0.3);
+            padding: 8px;
+            border-radius: 4px;
+            margin-top: 12px;
+        }
+
+        #loading {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            background: rgba(0, 0, 0, 0.9);
+            padding: 25px 40px;
+            border-radius: 8px;
+            border: 2px solid #00bcd4;
+            text-align: center;
+            z-index: 200;
+        }
+
+        #loading h2 { color: #00bcd4; margin-bottom: 12px; font-size: 1.1em; }
+
+        .spinner {
+            width: 35px;
+            height: 35px;
+            border: 3px solid #333;
+            border-top: 3px solid #00bcd4;
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+            margin: 0 auto;
+        }
+
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+
+        #loading.hidden { display: none; }
+
+        #progress-bar {
+            position: absolute;
+            bottom: 50px;
+            left: 10px;
+            width: 200px;
+            background: rgba(0, 0, 0, 0.6);
+            padding: 8px 12px;
+            border-radius: 6px;
+            z-index: 100;
+        }
+
+        #frame-slider { width: 100%; height: 6px; cursor: pointer; }
+        #frame-slider::-webkit-slider-thumb { width: 16px; height: 16px; }
+    </style>
+</head>
+<body>
+    <div id="container">
+        <div id="canvas-container">
+            <canvas id="viewer"></canvas>
+
+            <div id="frame-indicator">
+                <h1>Cryo-EM Viewer</h1>
+                <div id="frame-counter">1 / 5</div>
+                <div id="frame-name">Loading...</div>
+            </div>
+
+            <div id="progress-bar">
+                <input type="range" id="frame-slider" min="0" max="4" value="0">
+            </div>
+
+            <div id="nav-hints">
+                <div class="hint"><span class="key">&#8592;&#8594;</span> Frames</div>
+                <div class="hint"><span class="key">Scroll</span> Zoom</div>
+                <div class="hint"><span class="key">Drag</span> Rotate</div>
+            </div>
+
+            <div id="loading">
+                <h2>Loading Images...</h2>
+                <div class="spinner"></div>
+                <p id="loading-status">Connecting...</p>
+            </div>
+        </div>
+
+        <div id="control-panel">
+            <h2>Image Viewer</h2>
+
+            <div id="status">
+                <strong>Status:</strong> <span id="status-text">Initializing...</span>
+            </div>
+
+            <div class="section">
+                <h3>Frame Navigation</h3>
+                <div class="nav-buttons">
+                    <button id="prev-btn">&#8592; Prev</button>
+                    <button id="next-btn">Next &#8594;</button>
+                </div>
+            </div>
+
+            <div class="section">
+                <h3>View</h3>
+                <button id="reset-view">Reset View</button>
+                <button id="front-view">Front View</button>
+                <button id="close-view">Close Up</button>
+                <button id="angled-view">Angled View</button>
+            </div>
+
+            <div class="section">
+                <h3>Image Adjustment</h3>
+                <div class="control-group">
+                    <label>Brightness <span class="value-display" id="brightness-val">1.0</span></label>
+                    <input type="range" id="brightness" min="0.2" max="3" step="0.1" value="1.0">
+                </div>
+                <div class="control-group">
+                    <label>Contrast <span class="value-display" id="contrast-val">1.0</span></label>
+                    <input type="range" id="contrast" min="0.2" max="3" step="0.1" value="1.0">
+                </div>
+            </div>
+
+            <div class="help-text">
+                <strong>3D Navigation:</strong><br>
+                Scroll: Move closer/further<br>
+                Left drag: Rotate view<br>
+                Right drag: Pan<br>
+                Arrow keys: Change frame<br><br>
+                <strong>Data:</strong><br>
+                Full resolution: 7676 x 7420<br>
+                T20S Proteasome (EMPIAR-10025)
+            </div>
+        </div>
+    </div>
+
+    <script type="importmap">
+    {
+        "imports": {
+            "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+            "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+        }
+    }
+    </script>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+        const canvas = document.getElementById('viewer');
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color(0x000000);
+
+        const camera = new THREE.PerspectiveCamera(
+            50, canvas.clientWidth / canvas.clientHeight, 0.1, 50000
+        );
+        camera.position.set(0, 0, 300);
+
+        const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
+        renderer.setSize(canvas.clientWidth, canvas.clientHeight);
+        renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+
+        // OrbitControls with FASTER rotation
+        const controls = new OrbitControls(camera, canvas);
+        controls.enableDamping = true;
+        controls.dampingFactor = 0.08;
+        controls.rotateSpeed = 2.0;      // Much faster rotation (default is 1.0)
+        controls.panSpeed = 2.0;         // Faster panning too
+        controls.zoomSpeed = 1.5;        // Slightly faster zoom
+        controls.target.set(0, 0, 0);
+        controls.minDistance = 5;
+        controls.maxDistance = 5000;
+
+        scene.add(new THREE.AmbientLight(0xffffff, 1.0));
+
+        let textures = [];
+        let currentFrame = 0;
+        let imagePlane = null;
+        let imageNames = [];
+        let brightness = 1.0;
+        let contrast = 1.0;
+
+        const textureLoader = new THREE.TextureLoader();
+
+        async function loadImages() {
+            document.getElementById('loading-status').textContent = 'Fetching metadata...';
+
+            try {
+                const response = await fetch('/metadata');
+                const metadata = await response.json();
+                const nImages = metadata.n_micrographs || 5;
+
+                document.getElementById('loading-status').textContent = `Loading ${nImages} full-res images...`;
+                document.getElementById('frame-slider').max = nImages - 1;
+
+                for (let i = 0; i < nImages; i++) {
+                    document.getElementById('loading-status').textContent = `Loading image ${i + 1}/${nImages}...`;
+
+                    const texture = await new Promise((resolve, reject) => {
+                        textureLoader.load(`/micrograph/${i}`, resolve, undefined, reject);
+                    });
+
+                    texture.minFilter = THREE.LinearFilter;
+                    texture.magFilter = THREE.LinearFilter;
+                    textures.push(texture);
+                    imageNames.push(`Micrograph ${i + 1}`);
+                }
+
+                try {
+                    const namesResponse = await fetch('/image_names');
+                    const names = await namesResponse.json();
+                    if (names && names.length) {
+                        imageNames = names.map(n => n.split('/').pop().replace('_denoised.png', ''));
+                    }
+                } catch (e) {}
+
+                createImagePlane();
+                updateDisplay();
+
+                document.getElementById('loading').classList.add('hidden');
+                document.getElementById('status-text').textContent = `${textures.length} images loaded`;
+
+            } catch (error) {
+                console.error('Failed to load:', error);
+                document.getElementById('loading-status').textContent = 'Error loading images';
+            }
+        }
+
+        function createImagePlane() {
+            if (imagePlane) {
+                scene.remove(imagePlane);
+                imagePlane.geometry.dispose();
+                imagePlane.material.dispose();
+            }
+
+            if (textures.length === 0) return;
+
+            const texture = textures[currentFrame];
+            const imgWidth = texture.image.width;
+            const imgHeight = texture.image.height;
+
+            const scale = 200 / Math.max(imgWidth, imgHeight);
+            const planeWidth = imgWidth * scale;
+            const planeHeight = imgHeight * scale;
+
+            const geometry = new THREE.PlaneGeometry(planeWidth, planeHeight);
+
+            const material = new THREE.ShaderMaterial({
+                uniforms: {
+                    map: { value: texture },
+                    brightness: { value: brightness },
+                    contrast: { value: contrast }
+                },
+                vertexShader: `
+                    varying vec2 vUv;
+                    void main() {
+                        vUv = uv;
+                        gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+                    }
+                `,
+                fragmentShader: `
+                    uniform sampler2D map;
+                    uniform float brightness;
+                    uniform float contrast;
+                    varying vec2 vUv;
+
+                    void main() {
+                        vec4 color = texture2D(map, vUv);
+                        color.rgb *= brightness;
+                        color.rgb = (color.rgb - 0.5) * contrast + 0.5;
+                        gl_FragColor = color;
+                    }
+                `,
+                side: THREE.DoubleSide
+            });
+
+            imagePlane = new THREE.Mesh(geometry, material);
+            scene.add(imagePlane);
+
+            const borderGeom = new THREE.EdgesGeometry(geometry);
+            const borderMat = new THREE.LineBasicMaterial({ color: 0x00bcd4, opacity: 0.3, transparent: true });
+            const border = new THREE.LineSegments(borderGeom, borderMat);
+            imagePlane.add(border);
+        }
+
+        function updateDisplay() {
+            document.getElementById('frame-counter').textContent = `${currentFrame + 1} / ${textures.length}`;
+            document.getElementById('frame-name').textContent = imageNames[currentFrame] || `Frame ${currentFrame + 1}`;
+            document.getElementById('frame-slider').value = currentFrame;
+        }
+
+        function setFrame(index) {
+            if (textures.length === 0) return;
+            currentFrame = Math.max(0, Math.min(index, textures.length - 1));
+
+            if (imagePlane && imagePlane.material.uniforms) {
+                imagePlane.material.uniforms.map.value = textures[currentFrame];
+            }
+            updateDisplay();
+        }
+
+        function nextFrame() { setFrame((currentFrame + 1) % textures.length); }
+        function prevFrame() { setFrame((currentFrame - 1 + textures.length) % textures.length); }
+
+        document.addEventListener('keydown', (e) => {
+            if (e.key === 'ArrowRight') { nextFrame(); e.preventDefault(); }
+            if (e.key === 'ArrowLeft') { prevFrame(); e.preventDefault(); }
+        });
+
+        document.getElementById('next-btn').onclick = nextFrame;
+        document.getElementById('prev-btn').onclick = prevFrame;
+        document.getElementById('frame-slider').oninput = (e) => setFrame(parseInt(e.target.value));
+
+        document.getElementById('reset-view').onclick = () => {
+            camera.position.set(0, 0, 300);
+            controls.target.set(0, 0, 0);
+            controls.update();
+        };
+
+        document.getElementById('front-view').onclick = () => {
+            camera.position.set(0, 0, 200);
+            controls.target.set(0, 0, 0);
+            controls.update();
+        };
+
+        document.getElementById('close-view').onclick = () => {
+            camera.position.set(0, 0, 50);
+            controls.target.set(0, 0, 0);
+            controls.update();
+        };
+
+        document.getElementById('angled-view').onclick = () => {
+            camera.position.set(100, 80, 200);
+            controls.target.set(0, 0, 0);
+            controls.update();
+        };
+
+        document.getElementById('brightness').oninput = (e) => {
+            brightness = parseFloat(e.target.value);
+            document.getElementById('brightness-val').textContent = brightness.toFixed(1);
+            if (imagePlane) imagePlane.material.uniforms.brightness.value = brightness;
+        };
+
+        document.getElementById('contrast').oninput = (e) => {
+            contrast = parseFloat(e.target.value);
+            document.getElementById('contrast-val').textContent = contrast.toFixed(1);
+            if (imagePlane) imagePlane.material.uniforms.contrast.value = contrast;
+        };
+
+        function animate() {
+            requestAnimationFrame(animate);
+            controls.update();
+            renderer.render(scene, camera);
+        }
+
+        window.addEventListener('resize', () => {
+            camera.aspect = canvas.clientWidth / canvas.clientHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(canvas.clientWidth, canvas.clientHeight);
+        });
+
+        loadImages();
+        animate();
+    </script>
+</body>
+</html>
