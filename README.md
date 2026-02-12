@@ -8,6 +8,8 @@ https://youtu.be/tGr9yvtkZG8
 
 https://youtu.be/xmCIDMZkR8M?si=7Eap-uLpPxFMNfyK
 
+https://youtu.be/KoaXAphhRHY?si=ETU45rrOLz9s9d0Y
+
 ## Key Achievement
 
 This project demonstrates that **viewing cryo-EM data in 3D space significantly enhances structure visibility** - even for inherently 2D projection images. By moving the image through 3D space, the visual cortex engages differently than with static 2D viewing, making it easier to distinguish signal from noise and identify protein structures.
