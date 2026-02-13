@@ -1,0 +1,498 @@
+!================================================================
+! Cryo-EM Denoising Engine - CUDA Fortran + cuDNN
+!================================================================
+! High-performance inference engine for cryo-EM micrograph
+! denoising using a 12-layer residual CNN.
+!
+! Reads MRC movie files directly, averages frames, denoises
+! via batched GPU inference, and writes PGM output.
+!
+! Usage: cryo_denoise_engine <model_dir> <input.mrc> <output.pgm>
+!================================================================
+
+program cryo_denoise_engine
+    use cudafor
+    use iso_c_binding
+    use conv2d_cudnn
+    use mrc_reader
+    implicit none
+
+    ! cuDNN handle interface
+    interface
+        function cudnnCreate(handle) bind(c, name='cudnnCreate')
+            import :: c_ptr, c_int
+            type(c_ptr), intent(out) :: handle
+            integer(c_int) :: cudnnCreate
+        end function
+        function cudnnDestroy(handle) bind(c, name='cudnnDestroy')
+            import :: c_ptr, c_int
+            type(c_ptr), value :: handle
+            integer(c_int) :: cudnnDestroy
+        end function
+    end interface
+
+    ! Network architecture
+    integer, parameter :: NUM_LAYERS = 12
+    integer, parameter :: HIDDEN_CH = 32
+    integer, parameter :: KERNEL_SIZE = 3
+    integer, parameter :: PADDING = 1
+    integer, parameter :: PATCH_SIZE = 64
+    integer, parameter :: OVERLAP = 48
+    integer, parameter :: STRIDE = PATCH_SIZE - OVERLAP  ! 16
+    integer, parameter :: MAX_BATCH = 512
+
+    ! cuDNN
+    type(c_ptr) :: cudnn_handle
+    type(conv2d_layer_t) :: layers(NUM_LAYERS)
+
+    ! Ping-pong activation buffers (only 2 needed, not 11)
+    real(4), device, allocatable :: d_buf_a(:,:,:,:)
+    real(4), device, allocatable :: d_buf_b(:,:,:,:)
+
+    ! Batch I/O buffers
+    real(4), device, allocatable :: d_batch_in(:,:,:,:)
+    real(4), device, allocatable :: d_batch_out(:,:,:,:)
+    real(4), allocatable :: h_batch_in(:,:,:,:)
+    real(4), allocatable :: h_batch_out(:,:,:,:)
+
+    ! Image buffers
+    real(4), allocatable :: image(:)       ! flat (nx*ny)
+    real(4), allocatable :: output(:)      ! flat (nx*ny)
+    real(4), allocatable :: weight_map(:)  ! flat (nx*ny)
+
+    ! Patch coordinates
+    integer, allocatable :: patch_x(:), patch_y(:)
+    integer :: total_patches
+
+    ! CLI args
+    character(len=512) :: model_dir, input_file, output_file
+    integer :: nx, ny, nz, mode
+    real(4) :: img_mean, img_std
+    integer :: istat, i
+
+    ! Residual subtraction element count
+    integer :: residual_n
+
+    ! Timing
+    integer(8) :: t_start, t_end, t_rate
+
+    call system_clock(t_start, t_rate)
+
+    ! Parse arguments
+    if (command_argument_count() < 3) then
+        print *, "Usage: cryo_denoise_engine <model_dir> <input.mrc> <output.pgm>"
+        stop 1
+    endif
+    call get_command_argument(1, model_dir)
+    call get_command_argument(2, input_file)
+    call get_command_argument(3, output_file)
+
+    print *, ""
+    print *, "=============================================="
+    print *, "  Cryo-EM Denoiser - CUDA Fortran Engine"
+    print *, "=============================================="
+    print '(A,A)', "  Model:  ", trim(model_dir)
+    print '(A,A)', "  Input:  ", trim(input_file)
+    print '(A,A)', "  Output: ", trim(output_file)
+
+    ! --- Initialize cuDNN ---
+    istat = cudnnCreate(cudnn_handle)
+    if (istat /= 0) then
+        print *, "ERROR: Failed to create cuDNN handle"
+        stop 1
+    endif
+
+    ! --- Initialize CNN layers ---
+    print *, ""
+    print *, "  Initializing CNN layers..."
+    call conv2d_init(layers(1), cudnn_handle, 1, HIDDEN_CH, KERNEL_SIZE, &
+                     PADDING, 1, MAX_BATCH, PATCH_SIZE, PATCH_SIZE, .true.)
+    do i = 2, 11
+        call conv2d_init(layers(i), cudnn_handle, HIDDEN_CH, HIDDEN_CH, KERNEL_SIZE, &
+                         PADDING, 1, MAX_BATCH, PATCH_SIZE, PATCH_SIZE, .true.)
+    end do
+    call conv2d_init(layers(12), cudnn_handle, HIDDEN_CH, 1, KERNEL_SIZE, &
+                     PADDING, 1, MAX_BATCH, PATCH_SIZE, PATCH_SIZE, .false.)
+
+    ! --- Load weights ---
+    print *, "  Loading weights..."
+    call load_weights(layers, trim(model_dir))
+
+    ! --- Read MRC file ---
+    call mrc_read_header(trim(input_file), nx, ny, nz, mode)
+    print '(A,I6,A,I6,A,I4,A,I2)', "  MRC: ", nx, " x ", ny, " x ", nz, " frames, mode=", mode
+
+    allocate(image(nx * ny))
+    call mrc_read_averaged(trim(input_file), image, nx, ny)
+    print '(A,I6,A,I6)', "  Averaged image: ", nx, " x ", ny
+
+    ! --- Normalize ---
+    img_mean = sum(image) / real(nx * ny, 4)
+    img_std = sqrt(sum((image - img_mean)**2) / real(nx * ny, 4)) + 1.0e-8
+    image = (image - img_mean) / img_std
+    print '(A,F12.4,A,F12.4)', "  Normalized: mean=", img_mean, " std=", img_std
+
+    ! --- Collect patch coordinates (including edges) ---
+    call collect_patch_coords(nx, ny, total_patches, patch_x, patch_y)
+    print '(A,I8,A)', "  Patches: ", total_patches, " (including edges)"
+
+    ! --- Allocate GPU buffers ---
+    ! Ping-pong: only 2 intermediate buffers instead of 11
+    allocate(d_buf_a(PATCH_SIZE, PATCH_SIZE, HIDDEN_CH, MAX_BATCH))
+    allocate(d_buf_b(PATCH_SIZE, PATCH_SIZE, HIDDEN_CH, MAX_BATCH))
+    allocate(d_batch_in(PATCH_SIZE, PATCH_SIZE, 1, MAX_BATCH))
+    allocate(d_batch_out(PATCH_SIZE, PATCH_SIZE, 1, MAX_BATCH))
+    allocate(h_batch_in(PATCH_SIZE, PATCH_SIZE, 1, MAX_BATCH))
+    allocate(h_batch_out(PATCH_SIZE, PATCH_SIZE, 1, MAX_BATCH))
+
+    ! Output accumulator
+    allocate(output(nx * ny), weight_map(nx * ny))
+    output = 0.0
+    weight_map = 0.0
+
+    ! --- Denoise ---
+    print *, "  Denoising..."
+    call process_all_patches()
+
+    ! --- Denormalize ---
+    where (weight_map > 0.0)
+        output = output / weight_map
+    end where
+    output = output * img_std + img_mean
+
+    ! --- Contrast stretch and write PGM ---
+    call write_pgm_contrast(trim(output_file), output, nx, ny)
+
+    ! --- Timing ---
+    call system_clock(t_end)
+    print '(A,F8.2,A)', "  Total time: ", real(t_end - t_start) / real(t_rate), " seconds"
+    print '(A,A)', "  Output: ", trim(output_file)
+    print *, ""
+
+    ! --- Cleanup ---
+    do i = 1, NUM_LAYERS
+        call conv2d_cleanup(layers(i))
+    end do
+    istat = cudnnDestroy(cudnn_handle)
+    deallocate(image, output, weight_map)
+    deallocate(d_buf_a, d_buf_b, d_batch_in, d_batch_out)
+    deallocate(h_batch_in, h_batch_out)
+    deallocate(patch_x, patch_y)
+
+contains
+
+    !================================================================
+    ! Residual subtraction kernel: out = in - out
+    !================================================================
+    subroutine residual_subtract_kernel(d_in, d_out, n)
+        real(4), device, intent(in) :: d_in(*)
+        real(4), device, intent(inout) :: d_out(*)
+        integer, intent(in) :: n
+        integer :: idx
+
+        !$cuf kernel do(1) <<< *, 256 >>>
+        do idx = 1, n
+            d_out(idx) = d_in(idx) - d_out(idx)
+        end do
+    end subroutine residual_subtract_kernel
+
+    !================================================================
+    ! Load weights from binary files (correct NCHW layout)
+    !================================================================
+    subroutine load_weights(layers, dir)
+        type(conv2d_layer_t), intent(inout) :: layers(:)
+        character(len=*), intent(in) :: dir
+
+        character(len=512) :: filename
+        real(4), allocatable :: w(:), b(:)
+        integer :: i, in_ch, out_ch, wsize
+        integer :: unit_num
+
+        do i = 1, NUM_LAYERS
+            if (i == 1) then
+                in_ch = 1;  out_ch = HIDDEN_CH
+            else if (i == 12) then
+                in_ch = HIDDEN_CH;  out_ch = 1
+            else
+                in_ch = HIDDEN_CH;  out_ch = HIDDEN_CH
+            endif
+
+            wsize = out_ch * in_ch * KERNEL_SIZE * KERNEL_SIZE
+
+            allocate(w(wsize), b(out_ch))
+
+            write(filename, '(A,A,I2.2,A)') trim(dir), "/conv", i, "_weights.bin"
+            open(newunit=unit_num, file=trim(filename), access='stream', &
+                 form='unformatted', status='old')
+            read(unit_num) w
+            close(unit_num)
+            ! Correct layout: (out_ch, in_ch, KS, KS) matching training save convention
+            layers(i)%weights = reshape(w, [out_ch, in_ch, KERNEL_SIZE, KERNEL_SIZE])
+
+            write(filename, '(A,A,I2.2,A)') trim(dir), "/conv", i, "_bias.bin"
+            open(newunit=unit_num, file=trim(filename), access='stream', &
+                 form='unformatted', status='old')
+            read(unit_num) b
+            close(unit_num)
+            layers(i)%bias = b
+
+            deallocate(w, b)
+        end do
+
+        print '(A,I2,A)', "    Loaded ", NUM_LAYERS, " layers"
+    end subroutine load_weights
+
+    !================================================================
+    ! Collect patch coordinates including edge patches
+    ! Matches Python denoise.py behavior exactly
+    !================================================================
+    subroutine collect_patch_coords(img_w, img_h, n_patches, px, py)
+        integer, intent(in) :: img_w, img_h
+        integer, intent(out) :: n_patches
+        integer, allocatable, intent(out) :: px(:), py(:)
+
+        integer :: x, y, count, max_patches
+        logical :: edge_x, edge_y
+
+        edge_x = mod(img_w - PATCH_SIZE, STRIDE) /= 0
+        edge_y = mod(img_h - PATCH_SIZE, STRIDE) /= 0
+
+        ! Count patches: regular grid + edge rows/columns + corner
+        max_patches = ((img_w - PATCH_SIZE) / STRIDE + 1) * &
+                      ((img_h - PATCH_SIZE) / STRIDE + 1)
+        if (edge_x) max_patches = max_patches + (img_h - PATCH_SIZE) / STRIDE + 1
+        if (edge_y) max_patches = max_patches + (img_w - PATCH_SIZE) / STRIDE + 1
+        if (edge_x .and. edge_y) max_patches = max_patches + 1
+
+        allocate(px(max_patches), py(max_patches))
+        count = 0
+
+        ! Regular grid (Python: for y ... for x ...)
+        do y = 0, img_h - PATCH_SIZE, STRIDE
+            do x = 0, img_w - PATCH_SIZE, STRIDE
+                count = count + 1
+                px(count) = x
+                py(count) = y
+            end do
+        end do
+
+        ! Right edge column
+        if (edge_x) then
+            x = img_w - PATCH_SIZE
+            do y = 0, img_h - PATCH_SIZE, STRIDE
+                count = count + 1
+                px(count) = x
+                py(count) = y
+            end do
+        endif
+
+        ! Bottom edge row
+        if (edge_y) then
+            y = img_h - PATCH_SIZE
+            do x = 0, img_w - PATCH_SIZE, STRIDE
+                count = count + 1
+                px(count) = x
+                py(count) = y
+            end do
+        endif
+
+        ! Corner
+        if (edge_x .and. edge_y) then
+            count = count + 1
+            px(count) = img_w - PATCH_SIZE
+            py(count) = img_h - PATCH_SIZE
+        endif
+
+        n_patches = count
+    end subroutine collect_patch_coords
+
+    !================================================================
+    ! Process all patches in batches with ping-pong buffers
+    !================================================================
+    subroutine process_all_patches()
+        integer :: batch_start, batch_end, batch_size
+        integer :: b, p, x0, y0, ix, iy, img_idx, patch_idx
+
+        do batch_start = 1, total_patches, MAX_BATCH
+            batch_end = min(batch_start + MAX_BATCH - 1, total_patches)
+            batch_size = batch_end - batch_start + 1
+
+            ! Extract patches into host buffer
+            do b = 1, batch_size
+                p = batch_start + b - 1
+                x0 = patch_x(p)
+                y0 = patch_y(p)
+                do iy = 1, PATCH_SIZE
+                    do ix = 1, PATCH_SIZE
+                        img_idx = (x0 + ix - 1) + (y0 + iy - 1) * nx + 1
+                        h_batch_in(ix, iy, 1, b) = image(img_idx)
+                    end do
+                end do
+            end do
+
+            ! Copy to device
+            d_batch_in(:,:,:,1:batch_size) = h_batch_in(:,:,:,1:batch_size)
+
+            ! Update batch size for all layers if needed
+            if (batch_size /= layers(1)%batch_size) then
+                do i = 1, NUM_LAYERS
+                    call conv2d_set_batch_size(layers(i), batch_size)
+                end do
+            endif
+
+            ! Forward pass with ping-pong buffers
+            ! Layer 1: input(1ch) -> buf_a(32ch)
+            call conv2d_forward(layers(1), d_batch_in(:,:,:,1:batch_size), &
+                                d_buf_a(:,:,:,1:batch_size))
+            ! Layers 2-11: alternate buf_a <-> buf_b
+            do i = 2, 11
+                if (mod(i, 2) == 0) then
+                    call conv2d_forward(layers(i), d_buf_a(:,:,:,1:batch_size), &
+                                        d_buf_b(:,:,:,1:batch_size))
+                else
+                    call conv2d_forward(layers(i), d_buf_b(:,:,:,1:batch_size), &
+                                        d_buf_a(:,:,:,1:batch_size))
+                endif
+            end do
+            ! Layer 12: last buffer(32ch) -> output(1ch)
+            ! After layer 11 (odd), result is in buf_b
+            call conv2d_forward(layers(12), d_buf_b(:,:,:,1:batch_size), &
+                                d_batch_out(:,:,:,1:batch_size))
+
+            ! Residual: denoised = input - predicted_noise
+            residual_n = PATCH_SIZE * PATCH_SIZE * 1 * batch_size
+            call residual_subtract_kernel(d_batch_in, d_batch_out, residual_n)
+
+            ! Copy back to host
+            h_batch_out(:,:,:,1:batch_size) = d_batch_out(:,:,:,1:batch_size)
+
+            ! Accumulate into output
+            do b = 1, batch_size
+                p = batch_start + b - 1
+                x0 = patch_x(p)
+                y0 = patch_y(p)
+                do iy = 1, PATCH_SIZE
+                    do ix = 1, PATCH_SIZE
+                        img_idx = (x0 + ix - 1) + (y0 + iy - 1) * nx + 1
+                        output(img_idx) = output(img_idx) + h_batch_out(ix, iy, 1, b)
+                        weight_map(img_idx) = weight_map(img_idx) + 1.0
+                    end do
+                end do
+            end do
+
+            if (mod(batch_start + batch_size - 1, 50000) < MAX_BATCH .or. &
+                batch_end == total_patches) then
+                print '(A,I8,A,I8)', "    Processed ", batch_end, " / ", total_patches
+            endif
+        end do
+
+        ! Restore original batch size
+        if (layers(1)%batch_size /= MAX_BATCH) then
+            do i = 1, NUM_LAYERS
+                call conv2d_set_batch_size(layers(i), MAX_BATCH)
+            end do
+        endif
+    end subroutine process_all_patches
+
+    !================================================================
+    ! Histogram-based contrast stretch + PGM output
+    ! Matches Python: percentile 0.5% - 99.5%, uint8
+    !================================================================
+    subroutine write_pgm_contrast(filename, img, w, h)
+        character(len=*), intent(in) :: filename
+        real(4), intent(in) :: img(w * h)
+        integer, intent(in) :: w, h
+
+        integer, parameter :: NBINS = 65536
+        integer :: histogram(NBINS)
+        real(4) :: vmin, vmax, vrange, scale
+        real(4) :: low_thresh, high_thresh
+        integer :: npixels, cumsum, i, ival
+        integer :: unit_num
+        integer(1), allocatable :: pixels(:)
+        real(4) :: val
+        integer :: bin
+
+        npixels = w * h
+
+        ! Find data range
+        vmin = img(1)
+        vmax = img(1)
+        do i = 2, npixels
+            if (img(i) < vmin) vmin = img(i)
+            if (img(i) > vmax) vmax = img(i)
+        end do
+        vrange = vmax - vmin
+        if (vrange < 1.0e-10) vrange = 1.0
+
+        ! Build histogram
+        histogram = 0
+        scale = real(NBINS - 1, 4) / vrange
+        do i = 1, npixels
+            bin = int((img(i) - vmin) * scale) + 1
+            bin = max(1, min(NBINS, bin))
+            histogram(bin) = histogram(bin) + 1
+        end do
+
+        ! Find 0.5th and 99.5th percentile via CDF walk
+        low_thresh = vmin
+        high_thresh = vmax
+        cumsum = 0
+        do i = 1, NBINS
+            cumsum = cumsum + histogram(i)
+            if (cumsum >= int(0.005 * npixels) .and. low_thresh == vmin) then
+                low_thresh = vmin + (real(i - 1, 4) / scale)
+            endif
+            if (cumsum >= int(0.995 * npixels) .and. high_thresh == vmax) then
+                high_thresh = vmin + (real(i - 1, 4) / scale)
+            endif
+        end do
+
+        ! Map to uint8 with contrast stretch
+        allocate(pixels(npixels))
+        scale = 255.0 / (high_thresh - low_thresh + 1.0e-8)
+        do i = 1, npixels
+            ival = int((img(i) - low_thresh) * scale)
+            if (ival < 0) ival = 0
+            if (ival > 255) ival = 255
+            ! PGM expects unsigned byte 0-255. Fortran int(1) is signed,
+            ! but the bit pattern from int(ival,1) wraps correctly:
+            ! 0-127 stays 0-127, 128-255 wraps to -128..-1 but the byte
+            ! in memory is the correct unsigned value for stream I/O.
+            pixels(i) = int(ival, 1)
+        end do
+
+        ! Write PGM (binary P5 format)
+        open(newunit=unit_num, file=trim(filename), access='stream', &
+             form='unformatted', status='replace')
+
+        ! PGM header as raw bytes
+        call write_pgm_header(unit_num, w, h)
+
+        ! Write pixel data (need unsigned 0-255, stored as signed int(1))
+        write(unit_num) pixels
+
+        close(unit_num)
+        deallocate(pixels)
+
+        print '(A,F8.2,A,F8.2)', "  Contrast: low=", low_thresh, " high=", high_thresh
+    end subroutine write_pgm_contrast
+
+    !================================================================
+    ! Write PGM header as formatted text into a stream file
+    !================================================================
+    subroutine write_pgm_header(unit_num, w, h)
+        integer, intent(in) :: unit_num, w, h
+        character(len=64) :: header_str
+        integer :: hlen
+
+        ! Build header: "P5\n<width> <height>\n255\n"
+        write(header_str, '(A,A,I0,A,I0,A,A)') &
+            "P5", char(10), w, " ", h, char(10), "255"
+        hlen = len_trim(header_str)
+        ! Write header bytes + final newline
+        write(unit_num) header_str(1:hlen)
+        write(unit_num) char(10)
+    end subroutine write_pgm_header
+
+end program cryo_denoise_engine

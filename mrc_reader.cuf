@@ -1,0 +1,129 @@
+!================================================================
+! MRC File Reader Module
+!================================================================
+! Reads MRC2014 format cryo-EM micrograph files.
+! Supports mode 0 (int8), mode 1 (int16), and mode 2 (float32).
+! Frame-by-frame reading keeps memory usage low (~110 MB for
+! 7420x7676 images instead of ~2 GB for full movie stacks).
+!================================================================
+module mrc_reader
+    implicit none
+
+    integer, parameter :: MRC_HEADER_SIZE = 1024  ! bytes
+
+contains
+
+    !================================================================
+    ! Read MRC header: extract nx, ny, nz, mode
+    !================================================================
+    subroutine mrc_read_header(filename, nx, ny, nz, mode)
+        character(len=*), intent(in) :: filename
+        integer, intent(out) :: nx, ny, nz, mode
+
+        integer :: unit_num, istat
+        integer :: header(256)
+
+        open(newunit=unit_num, file=trim(filename), access='stream', &
+             form='unformatted', status='old', iostat=istat)
+        if (istat /= 0) then
+            print *, "ERROR: Cannot open MRC file: ", trim(filename)
+            stop 1
+        endif
+
+        read(unit_num) header
+        close(unit_num)
+
+        nx   = header(1)  ! columns (width)
+        ny   = header(2)  ! rows (height)
+        nz   = header(3)  ! sections (frames)
+        mode = header(4)  ! data type
+
+    end subroutine mrc_read_header
+
+    !================================================================
+    ! Read MRC file and return frame-averaged 2D image as float32.
+    ! Reads frame-by-frame to limit memory usage.
+    ! Output image is (nx, ny) matching MRC convention.
+    !================================================================
+    subroutine mrc_read_averaged(filename, image, nx, ny)
+        character(len=*), intent(in) :: filename
+        integer, intent(in) :: nx, ny
+        real(4), intent(out) :: image(nx * ny)
+
+        integer :: unit_num, istat
+        integer :: header_nx, header_ny, nz, mode
+        integer :: npixels, frame, i
+        integer(1), allocatable :: frame_i8(:)
+        integer(2), allocatable :: frame_i16(:)
+        real(4), allocatable :: frame_f32(:)
+
+        ! Read header
+        call mrc_read_header(filename, header_nx, header_ny, nz, mode)
+
+        if (header_nx /= nx .or. header_ny /= ny) then
+            print *, "ERROR: MRC dimensions mismatch"
+            stop 1
+        endif
+
+        npixels = nx * ny
+
+        ! Open file, position after 1024-byte header
+        open(newunit=unit_num, file=trim(filename), access='stream', &
+             form='unformatted', status='old', iostat=istat)
+        if (istat /= 0) then
+            print *, "ERROR: Cannot open MRC file: ", trim(filename)
+            stop 1
+        endif
+
+        ! Initialize accumulator
+        image = 0.0
+
+        ! Read and accumulate frames based on mode
+        select case (mode)
+        case (0)  ! int8
+            allocate(frame_i8(npixels))
+            do frame = 1, nz
+                read(unit_num, pos=MRC_HEADER_SIZE + 1 + int(frame-1,8)*int(npixels,8)) frame_i8
+                do i = 1, npixels
+                    image(i) = image(i) + real(frame_i8(i), 4)
+                end do
+            end do
+            deallocate(frame_i8)
+
+        case (1)  ! int16
+            allocate(frame_i16(npixels))
+            do frame = 1, nz
+                read(unit_num, pos=MRC_HEADER_SIZE + 1 + int(frame-1,8)*int(npixels,8)*2) frame_i16
+                do i = 1, npixels
+                    image(i) = image(i) + real(frame_i16(i), 4)
+                end do
+            end do
+            deallocate(frame_i16)
+
+        case (2)  ! float32
+            allocate(frame_f32(npixels))
+            do frame = 1, nz
+                read(unit_num, pos=MRC_HEADER_SIZE + 1 + int(frame-1,8)*int(npixels,8)*4) frame_f32
+                do i = 1, npixels
+                    image(i) = image(i) + frame_f32(i)
+                end do
+            end do
+            deallocate(frame_f32)
+
+        case default
+            print *, "ERROR: Unsupported MRC mode:", mode
+            print *, "  Supported: 0 (int8), 1 (int16), 2 (float32)"
+            close(unit_num)
+            stop 1
+        end select
+
+        close(unit_num)
+
+        ! Average
+        if (nz > 1) then
+            image = image / real(nz, 4)
+        endif
+
+    end subroutine mrc_read_averaged
+
+end module mrc_reader

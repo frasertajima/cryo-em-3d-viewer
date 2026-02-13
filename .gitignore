@@ -23,6 +23,12 @@ venv/
 *.swp
 *.swo
 
+# CUDA Fortran build artifacts
+*.mod
+*.o
+cryo_denoise_engine
+*.pgm
+
 # OS
 .DS_Store
 Thumbs.db
