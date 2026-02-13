@@ -1,0 +1,713 @@
+!================================================================
+! Conv2D Layer Module - Reusable cuDNN Convolution
+!================================================================
+! Provides a modular 2D convolution layer using cuDNN.
+! Designed for building CNN architectures like U-Net.
+!
+! Features:
+!   - cuDNN-accelerated forward and backward passes
+!   - Configurable kernel size, padding, stride
+!   - Integrated Adam optimizer state
+!   - Automatic workspace management
+!
+! Usage:
+!   type(conv2d_layer_t) :: conv1
+!   call conv2d_init(conv1, cudnn_handle, 3, 32, 3, 1, 1, batch_size, 32, 32)
+!   call conv2d_forward(conv1, input, output)
+!   call conv2d_backward(conv1, grad_output, grad_input)
+!   call conv2d_update(conv1, learning_rate, timestep)
+!   call conv2d_cleanup(conv1)
+!
+! Author: v28e Climate CNN Team
+! Date: 2025-11-22
+!================================================================
+module conv2d_cudnn
+    use cudafor
+    use iso_c_binding
+    implicit none
+
+    !================================================================
+    ! cuDNN Constants
+    !================================================================
+    integer(c_int), parameter :: CUDNN_STATUS_SUCCESS = 0
+    integer(c_int), parameter :: CUDNN_TENSOR_NCHW = 0
+    integer(c_int), parameter :: CUDNN_DATA_FLOAT = 0
+    integer(c_int), parameter :: CUDNN_CROSS_CORRELATION = 0
+
+    ! Algorithm constants - use algorithms that require minimal workspace
+    integer(c_int), parameter :: CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_GEMM = 0
+    integer(c_int), parameter :: CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_PRECOMP_GEMM = 1
+    integer(c_int), parameter :: CUDNN_CONVOLUTION_BWD_DATA_ALGO_0 = 0  ! Minimal workspace
+    integer(c_int), parameter :: CUDNN_CONVOLUTION_BWD_DATA_ALGO_1 = 1
+    integer(c_int), parameter :: CUDNN_CONVOLUTION_BWD_FILTER_ALGO_0 = 0  ! Minimal workspace
+    integer(c_int), parameter :: CUDNN_CONVOLUTION_BWD_FILTER_ALGO_1 = 1
+
+    ! Activation constants
+    integer(c_int), parameter :: CUDNN_ACTIVATION_RELU = 1
+    integer(c_int), parameter :: CUDNN_PROPAGATE_NAN = 0
+
+    ! Adam hyperparameters (same as apex_adam_kernels)
+    real(4), parameter :: ADAM_BETA1 = 0.9
+    real(4), parameter :: ADAM_BETA2 = 0.999
+    real(4), parameter :: ADAM_EPSILON = 1.0e-8
+
+    !================================================================
+    ! Conv2D Layer Type
+    !================================================================
+    type :: conv2d_layer_t
+        ! Configuration
+        integer :: in_channels
+        integer :: out_channels
+        integer :: kernel_size
+        integer :: padding
+        integer :: stride
+        integer :: batch_size
+        integer :: in_height, in_width
+        integer :: out_height, out_width
+
+        ! cuDNN descriptors
+        type(c_ptr) :: input_desc = c_null_ptr
+        type(c_ptr) :: output_desc = c_null_ptr
+        type(c_ptr) :: filter_desc = c_null_ptr
+        type(c_ptr) :: bias_desc = c_null_ptr
+        type(c_ptr) :: conv_desc = c_null_ptr
+        type(c_ptr) :: activation_desc = c_null_ptr
+
+        ! Activation flag
+        logical :: use_relu = .false.
+
+        ! Pre-activation output (needed for backward when using ReLU)
+        real(4), device, allocatable :: pre_relu_output(:,:,:,:)
+
+        ! Weights and biases (NCHW format: out_ch, in_ch, kH, kW)
+        real(4), device, allocatable :: weights(:,:,:,:)
+        real(4), device, allocatable :: bias(:)
+
+        ! Gradients
+        real(4), device, allocatable :: grad_weights(:,:,:,:)
+        real(4), device, allocatable :: grad_bias(:)
+
+        ! Adam optimizer state - first moments
+        real(4), device, allocatable :: m_weights(:,:,:,:)
+        real(4), device, allocatable :: m_bias(:)
+        ! Adam optimizer state - second moments
+        real(4), device, allocatable :: v_weights(:,:,:,:)
+        real(4), device, allocatable :: v_bias(:)
+
+        ! Workspace
+        real(4), device, allocatable :: workspace(:)
+        integer(c_size_t) :: workspace_size = 0
+
+        ! cuDNN handle reference (not owned)
+        type(c_ptr) :: cudnn_handle = c_null_ptr
+
+        logical :: initialized = .false.
+    end type conv2d_layer_t
+
+    !================================================================
+    ! cuDNN C Interface
+    !================================================================
+    interface
+        function cudnnCreateTensorDescriptor(desc) bind(c, name='cudnnCreateTensorDescriptor')
+            import :: c_ptr, c_int
+            type(c_ptr), intent(out) :: desc
+            integer(c_int) :: cudnnCreateTensorDescriptor
+        end function
+
+        function cudnnSetTensor4dDescriptor(desc, format, datatype, n, c, h, w) &
+                bind(c, name='cudnnSetTensor4dDescriptor')
+            import :: c_ptr, c_int
+            type(c_ptr), value :: desc
+            integer(c_int), value :: format, datatype, n, c, h, w
+            integer(c_int) :: cudnnSetTensor4dDescriptor
+        end function
+
+        function cudnnDestroyTensorDescriptor(desc) bind(c, name='cudnnDestroyTensorDescriptor')
+            import :: c_ptr, c_int
+            type(c_ptr), value :: desc
+            integer(c_int) :: cudnnDestroyTensorDescriptor
+        end function
+
+        function cudnnCreateFilterDescriptor(desc) bind(c, name='cudnnCreateFilterDescriptor')
+            import :: c_ptr, c_int
+            type(c_ptr), intent(out) :: desc
+            integer(c_int) :: cudnnCreateFilterDescriptor
+        end function
+
+        function cudnnSetFilter4dDescriptor(desc, datatype, format, k, c, h, w) &
+                bind(c, name='cudnnSetFilter4dDescriptor')
+            import :: c_ptr, c_int
+            type(c_ptr), value :: desc
+            integer(c_int), value :: datatype, format, k, c, h, w
+            integer(c_int) :: cudnnSetFilter4dDescriptor
+        end function
+
+        function cudnnDestroyFilterDescriptor(desc) bind(c, name='cudnnDestroyFilterDescriptor')
+            import :: c_ptr, c_int
+            type(c_ptr), value :: desc
+            integer(c_int) :: cudnnDestroyFilterDescriptor
+        end function
+
+        function cudnnCreateConvolutionDescriptor(desc) bind(c, name='cudnnCreateConvolutionDescriptor')
+            import :: c_ptr, c_int
+            type(c_ptr), intent(out) :: desc
+            integer(c_int) :: cudnnCreateConvolutionDescriptor
+        end function
+
+        function cudnnSetConvolution2dDescriptor(desc, pad_h, pad_w, u, v, dilation_h, dilation_w, mode, datatype) &
+                bind(c, name='cudnnSetConvolution2dDescriptor')
+            import :: c_ptr, c_int
+            type(c_ptr), value :: desc
+            integer(c_int), value :: pad_h, pad_w, u, v, dilation_h, dilation_w, mode, datatype
+            integer(c_int) :: cudnnSetConvolution2dDescriptor
+        end function
+
+        function cudnnDestroyConvolutionDescriptor(desc) bind(c, name='cudnnDestroyConvolutionDescriptor')
+            import :: c_ptr, c_int
+            type(c_ptr), value :: desc
+            integer(c_int) :: cudnnDestroyConvolutionDescriptor
+        end function
+
+        function cudnnGetConvolutionForwardWorkspaceSize(handle, x_desc, w_desc, conv_desc, y_desc, algo, size_bytes) &
+                bind(c, name='cudnnGetConvolutionForwardWorkspaceSize')
+            import :: c_ptr, c_int, c_size_t
+            type(c_ptr), value :: handle, x_desc, w_desc, conv_desc, y_desc
+            integer(c_int), value :: algo
+            integer(c_size_t), intent(out) :: size_bytes
+            integer(c_int) :: cudnnGetConvolutionForwardWorkspaceSize
+        end function
+
+        function cudnnGetConvolutionBackwardDataWorkspaceSize(handle, w_desc, dy_desc, conv_desc, dx_desc, algo, size_bytes) &
+                bind(c, name='cudnnGetConvolutionBackwardDataWorkspaceSize')
+            import :: c_ptr, c_int, c_size_t
+            type(c_ptr), value :: handle, w_desc, dy_desc, conv_desc, dx_desc
+            integer(c_int), value :: algo
+            integer(c_size_t), intent(out) :: size_bytes
+            integer(c_int) :: cudnnGetConvolutionBackwardDataWorkspaceSize
+        end function
+
+        function cudnnGetConvolutionBackwardFilterWorkspaceSize(handle, x_desc, dy_desc, conv_desc, dw_desc, algo, size_bytes) &
+                bind(c, name='cudnnGetConvolutionBackwardFilterWorkspaceSize')
+            import :: c_ptr, c_int, c_size_t
+            type(c_ptr), value :: handle, x_desc, dy_desc, conv_desc, dw_desc
+            integer(c_int), value :: algo
+            integer(c_size_t), intent(out) :: size_bytes
+            integer(c_int) :: cudnnGetConvolutionBackwardFilterWorkspaceSize
+        end function
+
+        function cudnnConvolutionForward(handle, alpha, x_desc, x, w_desc, w, conv_desc, algo, &
+                workspace, workspace_size, beta, y_desc, y) bind(c, name='cudnnConvolutionForward')
+            import :: c_ptr, c_int, c_size_t
+            type(c_ptr), value :: handle, alpha, x_desc, x, w_desc, w, conv_desc, y_desc, y, workspace, beta
+            integer(c_int), value :: algo
+            integer(c_size_t), value :: workspace_size
+            integer(c_int) :: cudnnConvolutionForward
+        end function
+
+        function cudnnAddTensor(handle, alpha, a_desc, a, beta, c_desc, c_tensor) bind(c, name='cudnnAddTensor')
+            import :: c_ptr, c_int
+            type(c_ptr), value :: handle, alpha, a_desc, a, beta, c_desc, c_tensor
+            integer(c_int) :: cudnnAddTensor
+        end function
+
+        function cudnnConvolutionBackwardData(handle, alpha, w_desc, w, dy_desc, dy, conv_desc, algo, &
+                workspace, workspace_size, beta, dx_desc, dx) bind(c, name='cudnnConvolutionBackwardData')
+            import :: c_ptr, c_int, c_size_t
+            type(c_ptr), value :: handle, alpha, w_desc, w, dy_desc, dy, conv_desc, dx_desc, dx, workspace, beta
+            integer(c_int), value :: algo
+            integer(c_size_t), value :: workspace_size
+            integer(c_int) :: cudnnConvolutionBackwardData
+        end function
+
+        function cudnnConvolutionBackwardFilter(handle, alpha, x_desc, x, dy_desc, dy, conv_desc, algo, &
+                workspace, workspace_size, beta, dw_desc, dw) bind(c, name='cudnnConvolutionBackwardFilter')
+            import :: c_ptr, c_int, c_size_t
+            type(c_ptr), value :: handle, alpha, x_desc, x, dy_desc, dy, conv_desc, dw_desc, dw, workspace, beta
+            integer(c_int), value :: algo
+            integer(c_size_t), value :: workspace_size
+            integer(c_int) :: cudnnConvolutionBackwardFilter
+        end function
+
+        function cudnnConvolutionBackwardBias(handle, alpha, dy_desc, dy, beta, db_desc, db) &
+                bind(c, name='cudnnConvolutionBackwardBias')
+            import :: c_ptr, c_int
+            type(c_ptr), value :: handle, alpha, dy_desc, dy, beta, db_desc, db
+            integer(c_int) :: cudnnConvolutionBackwardBias
+        end function
+
+        ! Activation functions
+        function cudnnCreateActivationDescriptor(desc) bind(c, name='cudnnCreateActivationDescriptor')
+            import :: c_ptr, c_int
+            type(c_ptr), intent(out) :: desc
+            integer(c_int) :: cudnnCreateActivationDescriptor
+        end function
+
+        function cudnnSetActivationDescriptor(desc, mode, relu_nan_opt, coef) &
+                bind(c, name='cudnnSetActivationDescriptor')
+            import :: c_ptr, c_int, c_double
+            type(c_ptr), value :: desc
+            integer(c_int), value :: mode, relu_nan_opt
+            real(c_double), value :: coef
+            integer(c_int) :: cudnnSetActivationDescriptor
+        end function
+
+        function cudnnDestroyActivationDescriptor(desc) bind(c, name='cudnnDestroyActivationDescriptor')
+            import :: c_ptr, c_int
+            type(c_ptr), value :: desc
+            integer(c_int) :: cudnnDestroyActivationDescriptor
+        end function
+
+        function cudnnActivationForward(handle, activation_desc, alpha, x_desc, x, beta, y_desc, y) &
+                bind(c, name='cudnnActivationForward')
+            import :: c_ptr, c_int
+            type(c_ptr), value :: handle, activation_desc, alpha, x_desc, x, beta, y_desc, y
+            integer(c_int) :: cudnnActivationForward
+        end function
+
+        function cudnnActivationBackward(handle, activation_desc, alpha, y_desc, y, dy_desc, dy, &
+                x_desc, x, beta, dx_desc, dx) bind(c, name='cudnnActivationBackward')
+            import :: c_ptr, c_int
+            type(c_ptr), value :: handle, activation_desc, alpha, y_desc, y, dy_desc, dy
+            type(c_ptr), value :: x_desc, x, beta, dx_desc, dx
+            integer(c_int) :: cudnnActivationBackward
+        end function
+    end interface
+
+    public :: conv2d_layer_t
+    public :: conv2d_init, conv2d_forward, conv2d_backward
+    public :: conv2d_update, conv2d_cleanup
+    public :: conv2d_set_batch_size
+
+contains
+
+    !================================================================
+    ! Adam Update Kernel for 4D arrays (weights)
+    ! NOTE: lr should be the bias-corrected learning rate
+    !================================================================
+    subroutine adam_update_4d_kernel(weights, grads, m, v, lr_corrected, n)
+        real(4), device, intent(inout) :: weights(*)
+        real(4), device, intent(in) :: grads(*)
+        real(4), device, intent(inout) :: m(*), v(*)
+        real(4), intent(in) :: lr_corrected
+        integer, intent(in) :: n
+
+        integer :: i
+
+        !$cuf kernel do(1) <<< *, 256 >>>
+        do i = 1, n
+            m(i) = ADAM_BETA1 * m(i) + (1.0 - ADAM_BETA1) * grads(i)
+            v(i) = ADAM_BETA2 * v(i) + (1.0 - ADAM_BETA2) * grads(i) * grads(i)
+            weights(i) = weights(i) - lr_corrected * m(i) / (sqrt(v(i)) + ADAM_EPSILON)
+        end do
+
+    end subroutine adam_update_4d_kernel
+
+    !================================================================
+    ! Adam Update Kernel for 1D arrays (bias)
+    ! NOTE: lr should be the bias-corrected learning rate
+    !================================================================
+    subroutine adam_update_1d_kernel(weights, grads, m, v, lr_corrected, n)
+        real(4), device, intent(inout) :: weights(*)
+        real(4), device, intent(in) :: grads(*)
+        real(4), device, intent(inout) :: m(*), v(*)
+        real(4), intent(in) :: lr_corrected
+        integer, intent(in) :: n
+
+        integer :: i
+
+        !$cuf kernel do(1) <<< *, 256 >>>
+        do i = 1, n
+            m(i) = ADAM_BETA1 * m(i) + (1.0 - ADAM_BETA1) * grads(i)
+            v(i) = ADAM_BETA2 * v(i) + (1.0 - ADAM_BETA2) * grads(i) * grads(i)
+            weights(i) = weights(i) - lr_corrected * m(i) / (sqrt(v(i)) + ADAM_EPSILON)
+        end do
+
+    end subroutine adam_update_1d_kernel
+
+    !================================================================
+    ! Copy device array helper
+    !================================================================
+    subroutine copy_device_array(src, dst, n)
+        real(4), device, intent(in) :: src(*)
+        real(4), device, intent(out) :: dst(*)
+        integer, intent(in) :: n
+
+        integer :: i
+
+        !$cuf kernel do(1) <<< *, 256 >>>
+        do i = 1, n
+            dst(i) = src(i)
+        end do
+
+    end subroutine copy_device_array
+
+    !================================================================
+    ! Initialize Conv2D Layer
+    !================================================================
+    subroutine conv2d_init(layer, handle, in_channels, out_channels, kernel_size, &
+                          padding, stride, batch_size, in_height, in_width, use_relu)
+        type(conv2d_layer_t), intent(inout) :: layer
+        type(c_ptr), intent(in) :: handle
+        integer, intent(in) :: in_channels, out_channels, kernel_size
+        integer, intent(in) :: padding, stride, batch_size
+        integer, intent(in) :: in_height, in_width
+        logical, intent(in), optional :: use_relu
+
+        real(4), allocatable :: h_weights(:,:,:,:)
+        real(4) :: scale
+        integer :: stat
+        integer(c_size_t) :: ws_fwd, ws_bwd_data, ws_bwd_filter
+
+        ! Store configuration
+        layer%cudnn_handle = handle
+        layer%in_channels = in_channels
+        layer%out_channels = out_channels
+        layer%kernel_size = kernel_size
+        layer%padding = padding
+        layer%stride = stride
+        layer%batch_size = batch_size
+        layer%in_height = in_height
+        layer%in_width = in_width
+
+        ! Calculate output dimensions
+        layer%out_height = (in_height + 2*padding - kernel_size) / stride + 1
+        layer%out_width = (in_width + 2*padding - kernel_size) / stride + 1
+
+        ! Create tensor descriptors
+        stat = cudnnCreateTensorDescriptor(layer%input_desc)
+        stat = cudnnSetTensor4dDescriptor(layer%input_desc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, &
+                                         batch_size, in_channels, in_height, in_width)
+
+        stat = cudnnCreateTensorDescriptor(layer%output_desc)
+        stat = cudnnSetTensor4dDescriptor(layer%output_desc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, &
+                                         batch_size, out_channels, layer%out_height, layer%out_width)
+
+        ! Bias descriptor: (1, out_channels, 1, 1) for broadcasting
+        stat = cudnnCreateTensorDescriptor(layer%bias_desc)
+        stat = cudnnSetTensor4dDescriptor(layer%bias_desc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, &
+                                         1, out_channels, 1, 1)
+
+        ! Filter descriptor: (out_channels, in_channels, kernel_h, kernel_w)
+        stat = cudnnCreateFilterDescriptor(layer%filter_desc)
+        stat = cudnnSetFilter4dDescriptor(layer%filter_desc, CUDNN_DATA_FLOAT, CUDNN_TENSOR_NCHW, &
+                                         out_channels, in_channels, kernel_size, kernel_size)
+
+        ! Convolution descriptor
+        stat = cudnnCreateConvolutionDescriptor(layer%conv_desc)
+        stat = cudnnSetConvolution2dDescriptor(layer%conv_desc, padding, padding, stride, stride, &
+                                              1, 1, CUDNN_CROSS_CORRELATION, CUDNN_DATA_FLOAT)
+
+        ! Allocate weights: (out_channels, in_channels, kernel_size, kernel_size)
+        allocate(layer%weights(out_channels, in_channels, kernel_size, kernel_size))
+        allocate(layer%bias(out_channels))
+        allocate(layer%grad_weights(out_channels, in_channels, kernel_size, kernel_size))
+        allocate(layer%grad_bias(out_channels))
+
+        ! Allocate Adam state
+        allocate(layer%m_weights(out_channels, in_channels, kernel_size, kernel_size))
+        allocate(layer%v_weights(out_channels, in_channels, kernel_size, kernel_size))
+        allocate(layer%m_bias(out_channels))
+        allocate(layer%v_bias(out_channels))
+
+        ! Initialize Adam state to zero
+        layer%m_weights = 0.0
+        layer%v_weights = 0.0
+        layer%m_bias = 0.0
+        layer%v_bias = 0.0
+
+        ! He initialization for weights
+        scale = sqrt(2.0 / real(in_channels * kernel_size * kernel_size))
+        allocate(h_weights(out_channels, in_channels, kernel_size, kernel_size))
+        call random_number(h_weights)
+        h_weights = (h_weights - 0.5) * 2.0 * scale
+        layer%weights = h_weights
+        deallocate(h_weights)
+
+        ! Initialize bias to zero
+        layer%bias = 0.0
+
+        ! Get workspace size (max of forward, backward data, backward filter)
+        block
+            integer(c_size_t) :: ws_bwd_data, ws_bwd_filter
+
+            stat = cudnnGetConvolutionForwardWorkspaceSize(handle, layer%input_desc, layer%filter_desc, &
+                                                           layer%conv_desc, layer%output_desc, &
+                                                           CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_GEMM, ws_fwd)
+
+            stat = cudnnGetConvolutionBackwardDataWorkspaceSize(handle, layer%filter_desc, &
+                                                                layer%output_desc, layer%conv_desc, &
+                                                                layer%input_desc, CUDNN_CONVOLUTION_BWD_DATA_ALGO_0, &
+                                                                ws_bwd_data)
+
+            stat = cudnnGetConvolutionBackwardFilterWorkspaceSize(handle, layer%input_desc, &
+                                                                  layer%output_desc, layer%conv_desc, &
+                                                                  layer%filter_desc, CUDNN_CONVOLUTION_BWD_FILTER_ALGO_0, &
+                                                                  ws_bwd_filter)
+
+            ! Use max of all workspace sizes, with 8MB minimum, cap at 16MB to save memory
+            layer%workspace_size = min(max(ws_fwd, ws_bwd_data, ws_bwd_filter, int(8*1024*1024, c_size_t)), &
+                                      int(16*1024*1024, c_size_t))
+        end block
+        allocate(layer%workspace(layer%workspace_size / 4))  ! /4 for float count
+
+        ! Setup ReLU activation if requested
+        layer%use_relu = .false.
+        if (present(use_relu)) layer%use_relu = use_relu
+
+        if (layer%use_relu) then
+            stat = cudnnCreateActivationDescriptor(layer%activation_desc)
+            stat = cudnnSetActivationDescriptor(layer%activation_desc, CUDNN_ACTIVATION_RELU, &
+                                               CUDNN_PROPAGATE_NAN, 0.0d0)
+            ! Allocate pre-relu output for backward pass
+            ! NOTE: Use (W,H,C,N) order so F-order storage matches cuDNN's C-order expectation
+            allocate(layer%pre_relu_output(layer%out_width, layer%out_height, out_channels, batch_size))
+        endif
+
+        layer%initialized = .true.
+
+    end subroutine conv2d_init
+
+    !================================================================
+    ! Update Batch Size (for variable batch sizes)
+    !================================================================
+    subroutine conv2d_set_batch_size(layer, new_batch_size)
+        type(conv2d_layer_t), intent(inout) :: layer
+        integer, intent(in) :: new_batch_size
+
+        integer :: stat
+
+        if (new_batch_size == layer%batch_size) return
+
+        layer%batch_size = new_batch_size
+
+        ! Update tensor descriptors
+        stat = cudnnSetTensor4dDescriptor(layer%input_desc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, &
+                                         new_batch_size, layer%in_channels, layer%in_height, layer%in_width)
+        stat = cudnnSetTensor4dDescriptor(layer%output_desc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, &
+                                         new_batch_size, layer%out_channels, layer%out_height, layer%out_width)
+
+    end subroutine conv2d_set_batch_size
+
+    !================================================================
+    ! Forward Pass
+    !================================================================
+    subroutine conv2d_forward(layer, input, output)
+        type(conv2d_layer_t), intent(inout) :: layer
+        real(4), device, intent(in) :: input(*)
+        real(4), device, intent(out) :: output(*)
+
+        real(4), target :: alpha, beta
+        integer :: stat
+
+        ! CRITICAL FIX: Initialize alpha and beta on EVERY call
+        ! (not just first call - Fortran SAVE semantics!)
+        alpha = 1.0
+        beta = 0.0
+
+        ! Convolution: output = weights * input
+        stat = cudnnConvolutionForward(layer%cudnn_handle, c_loc(alpha), &
+                                       layer%input_desc, c_loc(input), &
+                                       layer%filter_desc, c_loc(layer%weights), &
+                                       layer%conv_desc, CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_PRECOMP_GEMM, &
+                                       c_loc(layer%workspace), layer%workspace_size, &
+                                       c_loc(beta), layer%output_desc, c_loc(output))
+
+        if (stat /= CUDNN_STATUS_SUCCESS) then
+            print *, "ERROR: cudnnConvolutionForward failed with status", stat
+        endif
+
+        ! Add bias: output = output + bias
+        beta = 1.0
+        stat = cudnnAddTensor(layer%cudnn_handle, c_loc(alpha), &
+                             layer%bias_desc, c_loc(layer%bias), &
+                             c_loc(beta), layer%output_desc, c_loc(output))
+
+        if (stat /= CUDNN_STATUS_SUCCESS) then
+            print *, "ERROR: cudnnAddTensor (bias) failed with status", stat
+        endif
+
+        ! Apply ReLU if enabled
+        if (layer%use_relu) then
+            ! Save pre-relu output for backward pass
+            call copy_device_array(output, layer%pre_relu_output, &
+                                  layer%batch_size * layer%out_channels * &
+                                  layer%out_height * layer%out_width)
+
+            beta = 0.0
+            stat = cudnnActivationForward(layer%cudnn_handle, layer%activation_desc, &
+                                         c_loc(alpha), layer%output_desc, c_loc(output), &
+                                         c_loc(beta), layer%output_desc, c_loc(output))
+
+            if (stat /= CUDNN_STATUS_SUCCESS) then
+                print *, "ERROR: cudnnActivationForward (ReLU) failed with status", stat
+            endif
+        endif
+
+    end subroutine conv2d_forward
+
+    !================================================================
+    ! Backward Pass
+    !================================================================
+    subroutine conv2d_backward(layer, input, output, grad_output, grad_input, compute_grad_input)
+        type(conv2d_layer_t), intent(inout) :: layer
+        real(4), device, intent(in) :: input(*)        ! Forward input (saved)
+        real(4), device, intent(in) :: output(*)       ! Forward output (for ReLU backward)
+        real(4), device, intent(inout) :: grad_output(*)  ! Gradient from next layer (modified if ReLU)
+        real(4), device, intent(out) :: grad_input(*)  ! Gradient to previous layer
+        logical, intent(in), optional :: compute_grad_input
+
+        real(4), target :: alpha, beta
+        integer :: stat
+        logical :: do_grad_input
+        real(4), device, allocatable :: grad_pre_relu(:)
+        integer :: out_size
+
+        ! CRITICAL FIX: Initialize on every call
+        alpha = 1.0
+        beta = 0.0
+
+        do_grad_input = .true.
+        if (present(compute_grad_input)) do_grad_input = compute_grad_input
+
+        ! If ReLU was used, backprop through it first
+        if (layer%use_relu) then
+            out_size = layer%batch_size * layer%out_channels * layer%out_height * layer%out_width
+            allocate(grad_pre_relu(out_size))
+
+            stat = cudnnActivationBackward(layer%cudnn_handle, layer%activation_desc, &
+                                          c_loc(alpha), layer%output_desc, c_loc(output), &
+                                          layer%output_desc, c_loc(grad_output), &
+                                          layer%output_desc, c_loc(layer%pre_relu_output), &
+                                          c_loc(beta), layer%output_desc, c_loc(grad_pre_relu))
+
+            if (stat /= CUDNN_STATUS_SUCCESS) then
+                print *, "ERROR: cudnnActivationBackward (ReLU) failed with status", stat
+            endif
+
+            ! Use grad_pre_relu for conv backward
+            stat = cudnnConvolutionBackwardBias(layer%cudnn_handle, c_loc(alpha), &
+                                               layer%output_desc, c_loc(grad_pre_relu), &
+                                               c_loc(beta), layer%bias_desc, c_loc(layer%grad_bias))
+        else
+            ! Gradient w.r.t. bias: sum over N, H, W
+            stat = cudnnConvolutionBackwardBias(layer%cudnn_handle, c_loc(alpha), &
+                                               layer%output_desc, c_loc(grad_output), &
+                                               c_loc(beta), layer%bias_desc, c_loc(layer%grad_bias))
+        endif
+
+        if (stat /= CUDNN_STATUS_SUCCESS) then
+            print *, "ERROR: cudnnConvolutionBackwardBias failed with status", stat
+        endif
+
+        ! Gradient w.r.t. weights (use grad_pre_relu if ReLU, else grad_output)
+        if (layer%use_relu) then
+            stat = cudnnConvolutionBackwardFilter(layer%cudnn_handle, c_loc(alpha), &
+                                                 layer%input_desc, c_loc(input), &
+                                                 layer%output_desc, c_loc(grad_pre_relu), &
+                                                 layer%conv_desc, CUDNN_CONVOLUTION_BWD_FILTER_ALGO_0, &
+                                                 c_loc(layer%workspace), layer%workspace_size, &
+                                                 c_loc(beta), layer%filter_desc, c_loc(layer%grad_weights))
+        else
+            stat = cudnnConvolutionBackwardFilter(layer%cudnn_handle, c_loc(alpha), &
+                                                 layer%input_desc, c_loc(input), &
+                                                 layer%output_desc, c_loc(grad_output), &
+                                                 layer%conv_desc, CUDNN_CONVOLUTION_BWD_FILTER_ALGO_0, &
+                                                 c_loc(layer%workspace), layer%workspace_size, &
+                                                 c_loc(beta), layer%filter_desc, c_loc(layer%grad_weights))
+        endif
+
+        if (stat /= CUDNN_STATUS_SUCCESS) then
+            print *, "ERROR: cudnnConvolutionBackwardFilter failed with status", stat
+        endif
+
+        ! Gradient w.r.t. input (skip for first layer)
+        if (do_grad_input) then
+            if (layer%use_relu) then
+                stat = cudnnConvolutionBackwardData(layer%cudnn_handle, c_loc(alpha), &
+                                                   layer%filter_desc, c_loc(layer%weights), &
+                                                   layer%output_desc, c_loc(grad_pre_relu), &
+                                                   layer%conv_desc, CUDNN_CONVOLUTION_BWD_DATA_ALGO_0, &
+                                                   c_loc(layer%workspace), layer%workspace_size, &
+                                                   c_loc(beta), layer%input_desc, c_loc(grad_input))
+            else
+                stat = cudnnConvolutionBackwardData(layer%cudnn_handle, c_loc(alpha), &
+                                                   layer%filter_desc, c_loc(layer%weights), &
+                                                   layer%output_desc, c_loc(grad_output), &
+                                                   layer%conv_desc, CUDNN_CONVOLUTION_BWD_DATA_ALGO_0, &
+                                                   c_loc(layer%workspace), layer%workspace_size, &
+                                                   c_loc(beta), layer%input_desc, c_loc(grad_input))
+            endif
+
+            if (stat /= CUDNN_STATUS_SUCCESS) then
+                print *, "ERROR: cudnnConvolutionBackwardData failed with status", stat
+            endif
+        endif
+
+        ! Cleanup temporary
+        if (layer%use_relu) deallocate(grad_pre_relu)
+
+    end subroutine conv2d_backward
+
+    !================================================================
+    ! Adam Update
+    !================================================================
+    subroutine conv2d_update(layer, lr, timestep)
+        type(conv2d_layer_t), intent(inout) :: layer
+        real(4), intent(in) :: lr
+        integer, intent(in) :: timestep
+
+        real(4) :: bias_corr1, bias_corr2
+        real(4) :: lr_corrected
+        integer :: i
+
+        bias_corr1 = 1.0 - ADAM_BETA1 ** timestep
+        bias_corr2 = 1.0 - ADAM_BETA2 ** timestep
+        lr_corrected = lr * sqrt(bias_corr2) / bias_corr1
+
+        ! Update weights - call kernel subroutine
+        call adam_update_4d_kernel(layer%weights, layer%grad_weights, &
+                                   layer%m_weights, layer%v_weights, &
+                                   lr_corrected, size(layer%weights))
+
+        ! Update bias
+        call adam_update_1d_kernel(layer%bias, layer%grad_bias, &
+                                   layer%m_bias, layer%v_bias, &
+                                   lr_corrected, size(layer%bias))
+
+    end subroutine conv2d_update
+
+    !================================================================
+    ! Cleanup
+    !================================================================
+    subroutine conv2d_cleanup(layer)
+        type(conv2d_layer_t), intent(inout) :: layer
+
+        integer :: stat
+
+        if (.not. layer%initialized) return
+
+        ! Destroy descriptors
+        if (c_associated(layer%input_desc)) stat = cudnnDestroyTensorDescriptor(layer%input_desc)
+        if (c_associated(layer%output_desc)) stat = cudnnDestroyTensorDescriptor(layer%output_desc)
+        if (c_associated(layer%bias_desc)) stat = cudnnDestroyTensorDescriptor(layer%bias_desc)
+        if (c_associated(layer%filter_desc)) stat = cudnnDestroyFilterDescriptor(layer%filter_desc)
+        if (c_associated(layer%conv_desc)) stat = cudnnDestroyConvolutionDescriptor(layer%conv_desc)
+        if (c_associated(layer%activation_desc)) stat = cudnnDestroyActivationDescriptor(layer%activation_desc)
+
+        ! Deallocate arrays
+        if (allocated(layer%weights)) deallocate(layer%weights)
+        if (allocated(layer%bias)) deallocate(layer%bias)
+        if (allocated(layer%grad_weights)) deallocate(layer%grad_weights)
+        if (allocated(layer%grad_bias)) deallocate(layer%grad_bias)
+        if (allocated(layer%m_weights)) deallocate(layer%m_weights)
+        if (allocated(layer%v_weights)) deallocate(layer%v_weights)
+        if (allocated(layer%m_bias)) deallocate(layer%m_bias)
+        if (allocated(layer%v_bias)) deallocate(layer%v_bias)
+        if (allocated(layer%workspace)) deallocate(layer%workspace)
+        if (allocated(layer%pre_relu_output)) deallocate(layer%pre_relu_output)
+
+        layer%initialized = .false.
+
+    end subroutine conv2d_cleanup
+
+end module conv2d_cudnn

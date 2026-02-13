@@ -27,6 +27,7 @@ venv/
 *.mod
 *.o
 cryo_denoise_engine
+cryo_denoise_engine_v2
 *.pgm
 
 # OS

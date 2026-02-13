@@ -4,13 +4,22 @@ FC = nvfortran
 FFLAGS = -cuda -O2 -Minfo=accel
 LIBS = -lcudnn
 
-TARGET = cryo_denoise_engine
-SRCS = conv2d_cudnn.cuf mrc_reader.cuf cryo_denoise_engine.cuf
+# Shared modules
+MODULES = conv2d_cudnn.cuf mrc_reader.cuf
 
-$(TARGET): $(SRCS)
+# Targets
+TARGET_V1 = cryo_denoise_engine
+TARGET_V2 = cryo_denoise_engine_v2
+
+all: $(TARGET_V1) $(TARGET_V2)
+
+$(TARGET_V1): $(MODULES) cryo_denoise_engine.cuf
+	$(FC) $(FFLAGS) -o $@ $^ $(LIBS)
+
+$(TARGET_V2): conv2d_cudnn_v2.cuf mrc_reader.cuf cryo_denoise_engine_v2.cuf
 	$(FC) $(FFLAGS) -o $@ $^ $(LIBS)
 
 clean:
-	rm -f $(TARGET) *.mod *.o
+	rm -f $(TARGET_V1) $(TARGET_V2) *.mod *.o
 
-.PHONY: clean
+.PHONY: all clean

@@ -16,7 +16,7 @@ Usage:
     python denoise_cuda.py /path/to/movies/ -o /custom/dir/  # Custom output
 
 Requirements:
-    - cryo_denoise_engine binary (run 'make' to build)
+    - cryo_denoise_engine_v2 binary (run 'make' to build)
     - Pillow (for PGM to PNG conversion)
     - Pre-trained model weights in models/ directory
 """
@@ -82,7 +82,7 @@ Examples:
 
     # Find engine binary
     script_dir = Path(__file__).parent.resolve()
-    engine = script_dir / "cryo_denoise_engine"
+    engine = script_dir / "cryo_denoise_engine_v2"
 
     # Default output to sample_data/ so viewer picks up new images
     if args.output is None:
